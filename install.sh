@@ -32,10 +32,12 @@ install_to() {
 
 if [ "$(id -u)" = "0" ]; then
     install_to || fail "could not install into $DEST"
-elif [ -w "$(dirname "$DEST" 2>/dev/null || echo /)" ] && [ -w "$DEST" ] 2>/dev/null; then
+elif { [ -d "$DEST" ] && [ -w "$DEST" ]; } \
+   || { [ ! -d "$DEST" ] && [ -w "$(dirname "$DEST")" ]; }; then
     install_to || fail "could not install into $DEST"
 else
     echo "Installing into $DEST needs administrator rights; requesting sudo ..."
+    sudo mkdir -p "$DEST"
     sudo install -m 0755 "$TMP" "$DEST/ipghost" || fail "could not install into $DEST"
 fi
 

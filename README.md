@@ -103,6 +103,9 @@ edit it for you, but it is plain JSON and safe to edit by hand:
 
 Runtime files after `up`: `ipghost.pid`, `state.json` (live counters),
 `ipghost.log`. Config changes take effect on the next `ipghost up`/`restart`.
+A ghost IP may carry several mappings as long as their ports don't overlap —
+handy for routing different ports of one "local" address to different
+remotes. `ipghost remove <ip>` removes all mappings for that IP.
 
 ## How it works
 
@@ -133,8 +136,10 @@ returns the ghost IP — that is the point.
 - **Protocols that embed IP addresses inside payloads** (FTP active mode,
   SIP, some games) are not rewritten.
 - Pick ghost IPs that don't collide with your real networks (e.g. from
-  `10.x` RFC1918 space you don't route, or `127.0.0.0/8`, which needs no
-  alias and no sudo for ports ≥ 1024).
+  `10.x` RFC1918 space you don't route). On Linux, any `127.x.x.x` ghost IP
+  binds without an alias and without sudo (ports ≥ 1024); on macOS only
+  `127.0.0.1` itself is bindable unprivileged — every other ghost IP needs
+  a loopback alias and therefore sudo.
 - Listeners are reachable from this host only (loopback interface).
 
 ## Troubleshooting
@@ -143,8 +148,8 @@ returns the ghost IP — that is the point.
   Most often a mapped port is already in use, or the ghost IP collides with
   a real local address.
 - **sudo is requested every `up`** — expected whenever a new alias must be
-  added or a port < 1024 is mapped; otherwise (e.g. `127.x.x.x` ghost IPs)
-  ipghost runs unprivileged.
+  added or a port < 1024 is mapped. Otherwise ipghost runs unprivileged
+  (Linux: any `127.x.x.x`; macOS: `127.0.0.1` only).
 - **Stale state after a crash** — `ipghost status` will note leftover
   aliases; run `ipghost down` to clean them up, or `up` to resume.
 - `--foreground` on `up` runs the daemon attached to your terminal for
