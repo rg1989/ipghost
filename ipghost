@@ -1,0 +1,1147 @@
+#!/usr/bin/env python3
+"""
+ipghost — make a remote host answer at a local IP address.
+
+ipghost assigns a "ghost" IP address to the loopback interface and runs a
+detached TCP/UDP relay: every connection your machine makes to the ghost IP
+is transparently forwarded to a remote host, and responses come back looking
+like they came from the ghost IP. Client software thinks it is talking to a
+local address; in reality the peer is remote.
+
+Usage:
+    ipghost add 10.99.99.99 example.com --ports 443,8080
+    ipghost up            # apply aliases + start detached daemon (sudo if needed)
+    ipghost status        # enabled/disabled, counters, exit 0/3
+    ipghost down          # stop daemon + remove IP aliases
+
+Requires: Python 3.8+, macOS (ifconfig) or Linux (ip). No third-party deps.
+"""
+import argparse
+import asyncio
+import functools
+import ipaddress
+import json
+import os
+import pwd
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+from collections import deque
+
+VERSION = "1.0.0"
+IS_MACOS = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+IFACE = "lo0" if IS_MACOS else "lo"
+
+CONNECT_TIMEOUT = 10.0
+UDP_IDLE_TIMEOUT = 60.0
+UDP_SWEEP_INTERVAL = 15.0
+MAX_UDP_SESSIONS = 1024
+MAX_PENDING_PACKETS = 64
+READ_BUF = 65536
+PORTS_CAP = 8192
+LOG_MAX_BYTES = 5 * 1024 * 1024
+STATE_TICK = 2.0
+DNS_TTL = 30.0
+
+HOSTNAME_RE = re.compile(
+    r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+)
+
+
+def die(msg, code=1):
+    print(f"ipghost: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- utilities
+
+def run_cmd(argv):
+    return subprocess.run(argv, capture_output=True, text=True)
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def fmt_bytes(n):
+    x = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if x < 1024.0 or unit == "TB":
+            return f"{x:.0f} {unit}" if unit == "B" else f"{x:.1f} {unit}"
+        x /= 1024.0
+    return f"{x:.1f} TB"
+
+
+def fmt_dur(seconds):
+    s = int(seconds)
+    return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def fmt_addr(peer):
+    try:
+        return f"{peer[0]}:{peer[1]}"
+    except (TypeError, IndexError):
+        return str(peer)
+
+
+# ------------------------------------------------------- platform: network
+
+def ip_bindable(ip):
+    """True if `ip` is currently assigned on this host and bindable.
+
+    Probing with an actual bind is exact and cross-platform: on Linux any
+    127/8 address binds out of the box, while macOS requires an explicit
+    loopback alias for every address except 127.0.0.1.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        try:
+            s.bind((ip, 0))
+            return True
+        except OSError:
+            return False
+    finally:
+        s.close()
+
+
+def alias_add(ip):
+    """Assign `ip` to the loopback interface. Returns (ok, error_text)."""
+    if IS_MACOS:
+        argv = ["ifconfig", IFACE, "alias", ip, "netmask", "255.255.255.255"]
+    else:
+        argv = ["ip", "address", "add", f"{ip}/32", "dev", IFACE]
+    r = run_cmd(argv)
+    return r.returncode == 0, (r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}")
+
+
+def alias_del(ip):
+    """Remove `ip` from the loopback interface. Returns (ok, error_text)."""
+    if IS_MACOS:
+        argv = ["ifconfig", IFACE, "-alias", ip]
+    else:
+        argv = ["ip", "address", "del", f"{ip}/32", "dev", IFACE]
+    r = run_cmd(argv)
+    return r.returncode == 0, (r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}")
+
+
+# ------------------------------------------------------------ ports config
+
+def expand_ports(spec):
+    """'443,8000-8100' -> sorted list of ints."""
+    ports = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            try:
+                lo, hi = int(a), int(b)
+            except ValueError:
+                raise ValueError(f"invalid port range {part!r}")
+            if not (1 <= lo <= 65535 and 1 <= hi <= 65535):
+                raise ValueError(f"port range {part!r} outside 1-65535")
+            if lo > hi:
+                raise ValueError(f"port range {part!r} is backwards")
+            ports.update(range(lo, hi + 1))
+        else:
+            try:
+                p = int(part)
+            except ValueError:
+                raise ValueError(f"invalid port {part!r}")
+            if not (1 <= p <= 65535):
+                raise ValueError(f"port {part!r} outside 1-65535")
+            ports.add(p)
+    if not ports:
+        raise ValueError("no ports given")
+    if len(ports) > PORTS_CAP:
+        raise ValueError(f"{len(ports)} ports exceeds cap of {PORTS_CAP}")
+    return sorted(ports)
+
+
+def format_ports(ports):
+    """Sorted ints -> compressed '53,443,8000-8100'."""
+    out = []
+    i = 0
+    while i < len(ports):
+        j = i
+        while j + 1 < len(ports) and ports[j + 1] == ports[j] + 1:
+            j += 1
+        out.append(str(ports[i]) if i == j else f"{ports[i]}-{ports[j]}")
+        i = j + 1
+    return ",".join(out)
+
+
+def parse_local_ip(s):
+    try:
+        ip = ipaddress.ip_address(s)
+    except ValueError:
+        raise ValueError(f"invalid IPv4 address {s!r}")
+    if not isinstance(ip, ipaddress.IPv4Address):
+        raise ValueError(f"{s!r} is IPv6; ipghost currently supports IPv4 only")
+    if ip.is_unspecified or ip.is_multicast or str(ip) == "255.255.255.255":
+        raise ValueError(f"{s!r} is not a usable host address")
+    return str(ip)
+
+
+def parse_remote(s):
+    try:
+        ip = ipaddress.ip_address(s)
+        if not isinstance(ip, ipaddress.IPv4Address):
+            raise ValueError(f"{s!r} is IPv6; ipghost currently supports IPv4 only")
+        return str(ip)
+    except ValueError:
+        if len(s) <= 253 and HOSTNAME_RE.match(s):
+            return s
+        raise ValueError(f"invalid remote address or hostname {s!r}")
+
+
+# ------------------------------------------------------------------- config
+
+def runtime_paths(cfg_path):
+    cfg_path = os.path.abspath(os.path.expanduser(cfg_path))
+    d = os.path.dirname(cfg_path)
+    return {
+        "dir": d,
+        "cfg": cfg_path,
+        "pid": os.path.join(d, "ipghost.pid"),
+        "state": os.path.join(d, "state.json"),
+        "aliases": os.path.join(d, "aliases.json"),
+        "log": os.path.join(d, "ipghost.log"),
+    }
+
+
+def validate_mapping(m):
+    for key in ("local", "remote", "ports"):
+        if key not in m:
+            raise ValueError(f"mapping missing required key {key!r}")
+    m["local"] = parse_local_ip(m["local"])
+    m["remote"] = parse_remote(m["remote"])
+    m["ports"] = format_ports(expand_ports(str(m["ports"])))
+    rp = m.get("remote_port")
+    if rp is not None:
+        rp = int(rp)
+        if not (1 <= rp <= 65535):
+            raise ValueError(f"remote_port {rp} outside 1-65535")
+        m["remote_port"] = rp
+    m["udp"] = bool(m.get("udp", True))
+    return m
+
+
+def load_config(path):
+    cfg = read_json(path)
+    if cfg is None:
+        return {"mappings": []}
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("mappings", []), list):
+        die(f"config {path} is malformed (expected JSON object with 'mappings' list)")
+    try:
+        cfg["mappings"] = [validate_mapping(m) for m in cfg["mappings"]]
+    except ValueError as e:
+        die(f"config {path}: {e}")
+    return cfg
+
+
+def save_config(path, cfg):
+    write_json(path, cfg)
+
+
+def read_aliases(paths):
+    data = read_json(paths["aliases"])
+    if isinstance(data, dict) and isinstance(data.get("added"), list):
+        return {ip for ip in data["added"] if isinstance(ip, str)}
+    return set()
+
+
+def write_aliases(paths, ips):
+    write_json(paths["aliases"], {"added": sorted(ips)})
+
+
+# ----------------------------------------------------------- daemon process
+
+class MappingCtx:
+    def __init__(self, m):
+        self.m = m
+        self.ports = expand_ports(m["ports"])
+        self.tcp_listeners = 0
+        self.udp_listeners = 0
+        self.tcp_active = 0
+        self.tcp_total = 0
+        self.tcp_failed = 0
+        self.tcp_bytes_up = 0
+        self.tcp_bytes_down = 0
+        self.udp_pkts_up = 0
+        self.udp_pkts_down = 0
+        self.udp_bytes_up = 0
+        self.udp_bytes_down = 0
+        self.udp_locals = []
+
+    def remote_port_for(self, port):
+        return self.m.get("remote_port") or port
+
+
+class UDPRemote(asyncio.DatagramProtocol):
+    """One upstream socket per client session; replies route back to it."""
+
+    def __init__(self, local_ep, client_addr):
+        self.local_ep = local_ep
+        self.client_addr = client_addr
+
+    def datagram_received(self, data, addr):
+        self.local_ep._deliver(self.client_addr, data)
+
+    def error_received(self, exc):
+        pass
+
+
+class UDPLocal(asyncio.DatagramProtocol):
+    """Listens on ghost_ip:port; fans datagrams out to per-client upstreams."""
+
+    def __init__(self, daemon, ctx, port):
+        self.daemon = daemon
+        self.ctx = ctx
+        self.port = port
+        self.transport = None
+        self.sessions = {}  # client_addr -> [transport, last_active]
+        self.pending = {}   # client_addr -> deque of buffered packets
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        ctx = self.ctx
+        s = self.sessions.get(addr)
+        if s is not None:
+            s[1] = time.monotonic()
+            ctx.udp_pkts_up += 1
+            ctx.udp_bytes_up += len(data)
+            s[0].sendto(data)
+            return
+        if addr in self.pending:
+            d = self.pending[addr]
+            if len(d) < MAX_PENDING_PACKETS:
+                ctx.udp_pkts_up += 1
+                ctx.udp_bytes_up += len(data)
+                d.append(data)
+            return
+        if len(self.sessions) >= MAX_UDP_SESSIONS:
+            log.warning("udp %s:%d session table full; dropping %s",
+                        ctx.m["local"], self.port, fmt_addr(addr))
+            return
+        ctx.udp_pkts_up += 1
+        ctx.udp_bytes_up += len(data)
+        self.pending[addr] = deque((data,))
+        self.daemon.loop.create_task(self._connect(addr))
+
+    async def _connect(self, addr):
+        buffered = self.pending.pop(addr, None)
+        if buffered is None or self.daemon.stopping:
+            return
+        try:
+            rip = await self.daemon.resolve(self.ctx.m["remote"])
+            rport = self.ctx.remote_port_for(self.port)
+            if rip == self.ctx.m["local"] and rport in self.ctx.ports:
+                raise RuntimeError("upstream resolves back to this ghost "
+                                   "listener (self-loop); refusing")
+            transport, _ = await self.daemon.loop.create_datagram_endpoint(
+                functools.partial(UDPRemote, self, addr), remote_addr=(rip, rport))
+        except Exception as e:
+            log.warning("udp %s:%d connect to %s failed: %s",
+                        self.ctx.m["local"], self.port, self.ctx.m["remote"], e)
+            return
+        self.sessions[addr] = [transport, time.monotonic()]
+        while buffered:
+            transport.sendto(buffered.popleft())
+
+    def _deliver(self, addr, data):
+        self.ctx.udp_pkts_down += 1
+        self.ctx.udp_bytes_down += len(data)
+        if self.transport is not None:
+            self.transport.sendto(data, addr)
+
+    def connection_lost(self, exc):
+        self.close()
+
+    def close(self):
+        self.transport = None
+        for addr, s in list(self.sessions.items()):
+            try:
+                s[0].close()
+            except Exception:
+                pass
+        self.sessions.clear()
+
+    def sweep(self):
+        now = time.monotonic()
+        for addr, s in list(self.sessions.items()):
+            if now - s[1] > UDP_IDLE_TIMEOUT:
+                try:
+                    s[0].close()
+                except Exception:
+                    pass
+                self.sessions.pop(addr, None)
+
+
+class Daemon:
+    def __init__(self, cfg, paths):
+        self.cfg = cfg
+        self.paths = paths
+        self.ctxs = [MappingCtx(m) for m in cfg["mappings"]]
+        self.servers = []
+        self.tcp_tasks = set()
+        self.dns = {}
+        self.started = time.time()
+        self.stopping = False
+        self.loop = None
+
+    # ---- state reporting -------------------------------------------------
+
+    def _current_user(self):
+        try:
+            return pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            return str(os.getuid())
+
+    def build_state(self, phase, err=None):
+        maps = []
+        for ctx in self.ctxs:
+            maps.append({
+                "local": ctx.m["local"],
+                "remote": ctx.m["remote"],
+                "remote_port": ctx.m.get("remote_port"),
+                "ports": ctx.ports,
+                "udp_enabled": bool(ctx.m.get("udp")),
+                "tcp": {
+                    "listeners": ctx.tcp_listeners,
+                    "active": ctx.tcp_active,
+                    "total": ctx.tcp_total,
+                    "failed": ctx.tcp_failed,
+                    "bytes_up": ctx.tcp_bytes_up,
+                    "bytes_down": ctx.tcp_bytes_down,
+                },
+                "udp": {
+                    "listeners": ctx.udp_listeners,
+                    "sessions": sum(len(ep.sessions) for ep in ctx.udp_locals),
+                    "pkts_up": ctx.udp_pkts_up,
+                    "pkts_down": ctx.udp_pkts_down,
+                    "bytes_up": ctx.udp_bytes_up,
+                    "bytes_down": ctx.udp_bytes_down,
+                },
+            })
+        st = {
+            "phase": phase,
+            "pid": os.getpid(),
+            "user": self._current_user(),
+            "started": self.started,
+            "updated": time.time(),
+            "mappings": maps,
+        }
+        if err:
+            st["error"] = err
+        return st
+
+    def write_state(self, phase, err=None):
+        try:
+            write_json(self.paths["state"], self.build_state(phase, err))
+        except OSError:
+            pass
+
+    # ---- helpers ----------------------------------------------------------
+
+    async def resolve(self, host):
+        try:
+            ipaddress.ip_address(host)
+            return host
+        except ValueError:
+            pass
+        now = self.loop.time()
+        cached = self.dns.get(host)
+        if cached and cached[0] > now:
+            return cached[1]
+        infos = await self.loop.run_in_executor(
+            None,
+            lambda: socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM))
+        ip = infos[0][4][0]
+        self.dns[host] = (now + DNS_TTL, ip)
+        return ip
+
+    # ---- tcp ---------------------------------------------------------------
+
+    async def _pump(self, ctx, reader, writer, up):
+        try:
+            while True:
+                data = await reader.read(READ_BUF)
+                if not data:
+                    break
+                if up:
+                    ctx.tcp_bytes_up += len(data)
+                else:
+                    ctx.tcp_bytes_down += len(data)
+                writer.write(data)
+                await writer.drain()
+        except (OSError, asyncio.CancelledError):
+            pass
+        except Exception:
+            log.exception("tcp pump error")
+        finally:
+            try:
+                if not writer.is_closing() and writer.can_write_eof():
+                    writer.write_eof()
+            except (OSError, RuntimeError):
+                pass
+
+    async def _handle_tcp(self, ctx, port, creader, cwriter):
+        self.tcp_tasks.add(asyncio.current_task())
+        ctx.tcp_total += 1
+        ctx.tcp_active += 1
+        peer = cwriter.get_extra_info("peername")
+        host = ctx.m["remote"]
+        rport = ctx.remote_port_for(port)
+        log.info("tcp %s:%d open client=%s -> %s:%d",
+                 ctx.m["local"], port, fmt_addr(peer), host, rport)
+        try:
+            try:
+                rip = await self.resolve(host)
+                if rip == ctx.m["local"] and rport in ctx.ports:
+                    raise RuntimeError(
+                        "upstream resolves back to this ghost listener "
+                        "(self-loop); refusing to connect")
+                ureader, uwriter = await asyncio.wait_for(
+                    asyncio.open_connection(rip, rport), CONNECT_TIMEOUT)
+            except Exception as e:
+                ctx.tcp_failed += 1
+                log.warning("tcp %s:%d connect to %s:%d failed: %s",
+                            ctx.m["local"], port, host, rport, e)
+                return
+            t1 = self.loop.create_task(self._pump(ctx, creader, uwriter, True))
+            t2 = self.loop.create_task(self._pump(ctx, ureader, cwriter, False))
+            try:
+                await asyncio.wait([t1, t2])
+            finally:
+                for t in (t1, t2):
+                    t.cancel()
+        finally:
+            for w in (cwriter,):
+                try:
+                    w.close()
+                except Exception:
+                    pass
+            ctx.tcp_active -= 1
+            self.tcp_tasks.discard(asyncio.current_task())
+            log.info("tcp %s:%d close client=%s up=%s down=%s",
+                     ctx.m["local"], port, fmt_addr(peer),
+                     fmt_bytes(ctx.tcp_bytes_up), fmt_bytes(ctx.tcp_bytes_down))
+
+    # ---- lifecycle ---------------------------------------------------------
+
+    def setup(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self.loop = loop
+        try:
+            import resource
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        except Exception:
+            pass
+        for ctx in self.ctxs:
+            if not ip_bindable(ctx.m["local"]):
+                raise RuntimeError(
+                    f"{ctx.m['local']} is not assigned to this host "
+                    f"(alias step failed?)")
+            for port in ctx.ports:
+                srv = loop.run_until_complete(asyncio.start_server(
+                    functools.partial(self._handle_tcp, ctx, port),
+                    ctx.m["local"], port))
+                self.servers.append(srv)
+                ctx.tcp_listeners += 1
+                if ctx.m.get("udp"):
+                    transport, ep = loop.run_until_complete(
+                        loop.create_datagram_endpoint(
+                            functools.partial(UDPLocal, self, ctx, port),
+                            local_addr=(ctx.m["local"], port)))
+                    ctx.udp_locals.append(ep)
+                    ctx.udp_listeners += 1
+
+    def drop_privileges(self):
+        if os.geteuid() != 0:
+            return
+        suid = os.environ.get("SUDO_UID")
+        if not suid:
+            return
+        try:
+            uid = int(suid)
+            gid = int(os.environ.get("SUDO_GID", suid))
+            user = os.environ.get("SUDO_USER") or pwd.getpwuid(uid).pw_name
+            for key in ("log", "state", "pid"):
+                p = self.paths[key]
+                if os.path.exists(p):
+                    try:
+                        os.chown(p, uid, gid)
+                    except OSError:
+                        pass
+            os.initgroups(user, gid)
+            os.setgid(gid)
+            os.setuid(uid)
+            log.info("dropped privileges to %s (uid %d)", user, uid)
+        except Exception as e:
+            log.warning("privilege drop failed (continuing as root): %s", e)
+
+    def _request_stop(self):
+        if self.stopping:
+            return
+        self.stopping = True
+        log.info("shutting down")
+        self.loop.create_task(self._shutdown())
+
+    async def _shutdown(self):
+        try:
+            try:
+                for srv in self.servers:
+                    srv.close()
+                for srv in self.servers:
+                    try:
+                        await srv.wait_closed()
+                    except Exception:
+                        pass
+                for ctx in self.ctxs:
+                    for ep in ctx.udp_locals:
+                        ep.close()
+                for t in list(self.tcp_tasks):
+                    t.cancel()
+                self.write_state("stopped")
+                try:
+                    os.remove(self.paths["pid"])
+                except OSError:
+                    pass
+                log.info("stopped")
+            finally:
+                self.loop.stop()
+        except Exception:
+            log.exception("error during shutdown")
+
+    async def _tick(self):
+        while not self.stopping:
+            await asyncio.sleep(STATE_TICK)
+            if self.stopping:
+                break
+            for ctx in self.ctxs:
+                for ep in ctx.udp_locals:
+                    ep.sweep()
+            self.write_state("ready")
+
+    def serve(self):
+        self.write_pidfile()
+        self.drop_privileges()
+        self.write_state("ready")
+        n_tcp = sum(c.tcp_listeners for c in self.ctxs)
+        n_udp = sum(c.udp_listeners for c in self.ctxs)
+        log.info("ipghost %s ready: pid %d user %s mappings %d "
+                 "tcp listeners %d udp listeners %d",
+                 VERSION, os.getpid(), self._current_user(),
+                 len(self.ctxs), n_tcp, n_udp)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            self.loop.add_signal_handler(sig, self._request_stop)
+        self.loop.create_task(self._tick())
+        try:
+            self.loop.run_forever()
+        finally:
+            self.loop.close()
+
+    def write_pidfile(self):
+        tmp = self.paths["pid"] + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(f"{os.getpid()}\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, self.paths["pid"])
+
+
+log = None
+
+
+def run_daemon(cfg_path):
+    global log
+    paths = runtime_paths(cfg_path)
+    os.makedirs(paths["dir"], exist_ok=True)
+    try:
+        if os.path.exists(paths["log"]) and os.path.getsize(paths["log"]) > LOG_MAX_BYTES:
+            os.replace(paths["log"], paths["log"] + ".old")
+    except OSError:
+        pass
+    import logging
+    logging.basicConfig(
+        filename=paths["log"],
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S")
+    log = logging.getLogger("ipghost")
+    log.info("ipghost %s starting (config %s)", VERSION, paths["cfg"])
+    cfg = load_config(paths["cfg"])
+    d = Daemon(cfg, paths)
+    try:
+        d.write_state("starting")
+        d.setup()
+    except Exception as e:
+        log.exception("startup failed")
+        d.write_state("error", err=str(e))
+        try:
+            os.remove(paths["pid"])
+        except OSError:
+            pass
+        sys.exit(1)
+    d.serve()
+
+
+# -------------------------------------------------------------- control CLI
+
+def daemon_pid(paths):
+    try:
+        with open(paths["pid"], "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def daemon_alive(paths):
+    pid = daemon_pid(paths)
+    return pid is not None and pid_alive(pid)
+
+
+def daemon_signalable(paths):
+    """True if the current user can signal the daemon (False if root-owned)."""
+    pid = daemon_pid(paths)
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return False
+    except OSError:
+        return False
+
+
+def needs_root_for(command, cfg, paths, args):
+    if os.geteuid() == 0:
+        return False
+    if command in ("up", "restart"):
+        for m in cfg["mappings"]:
+            if any(p < 1024 for p in expand_ports(m["ports"])):
+                return True
+            if not ip_bindable(m["local"]):
+                return True
+        if getattr(args, "force", False) and daemon_alive(paths) \
+                and not daemon_signalable(paths):
+            return True
+    if command in ("down", "restart"):
+        if daemon_alive(paths) and not daemon_signalable(paths):
+            return True
+        if read_aliases(paths):
+            return True
+    return False
+
+
+def reexec_sudo(cfg_path):
+    argv = []
+    skip = False
+    for a in sys.argv[1:]:
+        if skip:
+            skip = False
+            continue
+        if a == "--config":
+            skip = True
+            continue
+        if a.startswith("--config="):
+            continue
+        argv.append(a)
+    print("ipghost: administrator privileges are needed (IP alias / "
+          "privileged port); requesting sudo ...", file=sys.stderr)
+    try:
+        os.execvp("sudo", ["sudo", "--", sys.executable,
+                           os.path.abspath(__file__), "--config", cfg_path] + argv)
+    except FileNotFoundError:
+        die("sudo not found; please re-run this command as root")
+
+
+def wait_ready(paths, timeout=30.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st = read_json(paths["state"])
+        if st:
+            if st.get("phase") == "ready":
+                return st
+            if st.get("phase") == "error":
+                die(f"daemon failed to start: {st.get('error', 'unknown error')} "
+                    f"(see {paths['log']})")
+        time.sleep(0.1)
+    die(f"daemon did not become ready within {timeout:.0f}s (see {paths['log']})")
+
+
+def stop_daemon(paths):
+    pid = daemon_pid(paths)
+    if pid is None or not pid_alive(pid):
+        for key in ("pid", "state"):
+            try:
+                os.remove(paths[key])
+            except OSError:
+                pass
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    for _ in range(100):
+        if not pid_alive(pid):
+            break
+        time.sleep(0.1)
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        for _ in range(30):
+            if not pid_alive(pid):
+                break
+            time.sleep(0.1)
+    for key in ("pid", "state"):
+        try:
+            os.remove(paths[key])
+        except OSError:
+            pass
+    return True
+
+
+def do_up(paths, force=False, foreground=False):
+    cfg = load_config(paths["cfg"])
+    if not cfg["mappings"]:
+        die("no mappings configured; run: ipghost add <local-ip> <remote> --ports <ports>")
+    if daemon_alive(paths):
+        if not force:
+            pid = daemon_pid(paths)
+            die(f"already running (pid {pid}); use 'ipghost restart' or 'up --force'")
+        stop_daemon(paths)
+    os.makedirs(paths["dir"], exist_ok=True)
+
+    aliases = read_aliases(paths)
+    added = []
+    for m in cfg["mappings"]:
+        ip = m["local"]
+        if ip_bindable(ip):
+            continue
+        ok, err = alias_add(ip)
+        if not ok:
+            die(f"failed to add IP alias {ip} on {IFACE}: {err}")
+        aliases.add(ip)
+        added.append(ip)
+    write_aliases(paths, aliases)
+
+    for key in ("state", "pid"):
+        try:
+            os.remove(paths[key])
+        except OSError:
+            pass
+
+    if foreground:
+        run_daemon(paths["cfg"])
+        return
+
+    env = dict(os.environ, IPGHOST_DAEMON="1", IPGHOST_CONFIG=paths["cfg"])
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--config", paths["cfg"], "up"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True, env=env)
+    st = wait_ready(paths)
+    n_tcp = sum(m["tcp"]["listeners"] for m in st["mappings"])
+    n_udp = sum(m["udp"]["listeners"] for m in st["mappings"])
+    print(f"ipghost is UP — daemon pid {st['pid']} (user {st['user']})")
+    for ip in added:
+        print(f"  alias added: {ip} on {IFACE}")
+    if not added:
+        print("  no new IP aliases needed")
+    print(f"  mappings {len(st['mappings'])}  tcp listeners {n_tcp}  udp listeners {n_udp}")
+    print(f"  log: {paths['log']}")
+
+
+def do_down(paths):
+    stopped = stop_daemon(paths)
+    aliases = read_aliases(paths)
+    removed = []
+    for ip in sorted(aliases):
+        if not ip_bindable(ip):
+            continue
+        ok, err = alias_del(ip)
+        if ok:
+            removed.append(ip)
+        else:
+            print(f"  warning: failed to remove alias {ip} from {IFACE}: {err}")
+    write_aliases(paths, set())
+    if stopped:
+        print("ipghost is DOWN — daemon stopped")
+    for ip in removed:
+        print(f"  alias removed: {ip} from {IFACE}")
+    if not stopped and not removed:
+        print("ipghost is DOWN — not running; nothing to do")
+
+
+def do_restart(paths, force=False):
+    do_down(paths)
+    do_up(paths, force=force)
+
+
+def do_add(args):
+    paths = runtime_paths(args.config)
+    try:
+        local = parse_local_ip(args.local)
+        remote = parse_remote(args.remote)
+        ports = expand_ports(args.ports)
+    except ValueError as e:
+        die(str(e))
+    if args.remote_port is not None and not (1 <= args.remote_port <= 65535):
+        die(f"--remote-port must be 1-65535")
+    mapping = {
+        "local": local,
+        "remote": remote,
+        "ports": format_ports(ports),
+        "remote_port": args.remote_port,
+        "udp": not args.no_udp,
+    }
+    cfg = load_config(paths["cfg"])
+    # Self-loop guard: relaying a ghost IP back onto its own listeners.
+    try:
+        remote_ip = ipaddress.ip_address(remote)
+    except ValueError:
+        remote_ip = None
+    if remote_ip is not None and str(remote_ip) == local:
+        ghost_ports = set(ports)
+        for m in cfg["mappings"]:
+            if m["local"] == local:
+                ghost_ports |= set(expand_ports(m["ports"]))
+        effective = ports if args.remote_port is None else [args.remote_port]
+        looping = [p for p in effective if p in ghost_ports]
+        if looping:
+            die(f"remote {remote} is the ghost IP itself; effective remote "
+                f"port(s) {format_ports(looping)} would relay ipghost back "
+                f"into itself (self-loop)")
+    new_ports = set(ports)
+    for m in cfg["mappings"]:
+        if m["local"] != local:
+            continue
+        clash = new_ports & set(expand_ports(m["ports"]))
+        if clash:
+            die(f"ports {format_ports(sorted(clash))} are already mapped on "
+                f"{local} (-> {m['remote']}); run 'ipghost remove {local}' first")
+    cfg["mappings"].append(mapping)
+    os.makedirs(paths["dir"], exist_ok=True)
+    save_config(paths["cfg"], cfg)
+    rp = f":{args.remote_port}" if args.remote_port else ""
+    print(f"added mapping: {local} -> {remote}{rp}"
+          f"  ports {mapping['ports']}  udp {'on' if mapping['udp'] else 'off'}")
+    if daemon_alive(paths):
+        print("note: ipghost is running; use 'ipghost restart' to apply this change")
+    if any(p < 1024 for p in ports) or not ip_bindable(local):
+        print("note: 'ipghost up' will request sudo (new IP alias or privileged port)")
+
+
+def do_remove(args):
+    paths = runtime_paths(args.config)
+    local = parse_local_ip(args.local) if not args.local.startswith("~") else args.local
+    cfg = load_config(paths["cfg"])
+    kept = [m for m in cfg["mappings"] if m["local"] != local]
+    if len(kept) == len(cfg["mappings"]):
+        die(f"no mapping for {local}")
+    cfg["mappings"] = kept
+    save_config(paths["cfg"], cfg)
+    print(f"removed mapping: {local}")
+    if daemon_alive(paths):
+        print("note: ipghost is running; use 'ipghost restart' to apply this change")
+
+
+def do_list(args):
+    paths = runtime_paths(args.config)
+    cfg = load_config(paths["cfg"])
+    print(f"config: {paths['cfg']}")
+    if not cfg["mappings"]:
+        print("no mappings; add one with: ipghost add <local-ip> <remote> --ports <ports>")
+        return
+    for m in cfg["mappings"]:
+        rp = f":{m['remote_port']}" if m.get("remote_port") else ""
+        n_ports = len(expand_ports(m["ports"]))
+        print(f"  {m['local']}  ->  {m['remote']}{rp}   ports {m['ports']} "
+              f"({n_ports})   udp {'on' if m.get('udp') else 'off'}")
+
+
+def do_status(args):
+    paths = runtime_paths(args.config)
+    st = read_json(paths["state"])
+    alive = daemon_alive(paths)
+    aliases = read_aliases(paths)
+    if args.json:
+        print(json.dumps({
+            "running": alive,
+            "pid": daemon_pid(paths),
+            "phase": (st or {}).get("phase"),
+            "aliases": sorted(aliases),
+            "state": st,
+        }, indent=2))
+        raise SystemExit(0 if alive else 3)
+    if alive and st and st.get("phase") == "ready":
+        age = time.time() - st.get("updated", 0)
+        print(f"ipghost is UP — pid {st['pid']}, user {st['user']}, "
+              f"uptime {fmt_dur(time.time() - st['started'])}")
+        for m in st["mappings"]:
+            rp = f":{m['remote_port']}" if m.get("remote_port") else ""
+            print(f"  {m['local']}  ->  {m['remote']}{rp}")
+            alias_ok = ip_bindable(m["local"])
+            print(f"    ports {format_ports(m['ports'])}   alias "
+                  f"{'ok' if alias_ok else 'MISSING'}")
+            t = m["tcp"]
+            print(f"    tcp {t['listeners']} listeners | active {t['active']} | "
+                  f"total {t['total']} | failed {t['failed']} | "
+                  f"up {fmt_bytes(t['bytes_up'])} | down {fmt_bytes(t['bytes_down'])}")
+            if m.get("udp_enabled"):
+                u = m["udp"]
+                print(f"    udp {u['listeners']} listeners | sessions {u['sessions']} | "
+                      f"up {fmt_bytes(u['bytes_up'])} | down {fmt_bytes(u['bytes_down'])}")
+        if age > 30:
+            print(f"  warning: state is {int(age)}s old")
+        raise SystemExit(0)
+    if alive:
+        phase = (st or {}).get("phase", "starting")
+        print(f"ipghost is {phase} (pid {daemon_pid(paths)})")
+        raise SystemExit(0 if phase != "error" else 1)
+    if aliases:
+        print("ipghost is DOWN — daemon not running but aliases remain: "
+              f"{', '.join(sorted(aliases))}")
+        print("  run 'ipghost up' to restart, or 'ipghost down' to clean up")
+        raise SystemExit(3)
+    print("ipghost is DOWN — not running")
+    raise SystemExit(3)
+
+
+def do_logs(args):
+    paths = runtime_paths(args.config)
+    if not os.path.exists(paths["log"]):
+        die(f"no log file yet at {paths['log']}")
+    with open(paths["log"], "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - 256 * 1024))
+        text = f.read().decode("utf-8", "replace")
+    lines = text.splitlines()[-args.n:]
+    if lines:
+        print("\n".join(lines))
+
+
+# --------------------------------------------------------------------- main
+
+def main():
+    if os.environ.get("IPGHOST_DAEMON") == "1":
+        run_daemon(os.environ["IPGHOST_CONFIG"])
+        return
+    if not (IS_MACOS or IS_LINUX):
+        die("unsupported platform; ipghost supports macOS and Linux")
+
+    p = argparse.ArgumentParser(
+        prog="ipghost",
+        description="Make a remote host answer at a local IP address.",
+        epilog="examples:\n"
+               "  ipghost add 10.99.99.99 example.com --ports 443,8080\n"
+               "  ipghost up\n"
+               "  ipghost status\n"
+               "  ipghost down\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--config", default="~/.ipghost/config.json",
+                   help="config path; runtime files (pid/state/log) live alongside")
+    p.add_argument("--version", action="version", version=f"ipghost {VERSION}")
+    sub = p.add_subparsers(dest="cmd", metavar="command")
+    sub.required = True
+
+    sp = sub.add_parser("add",
+                        help="add a mapping local-ip -> remote (a ghost IP may "
+                             "have several mappings on disjoint ports)")
+    sp.add_argument("local", help="local 'ghost' IPv4 address, e.g. 10.99.99.99")
+    sp.add_argument("remote", help="remote IPv4 address or hostname")
+    sp.add_argument("--ports", required=True,
+                    help="ports to relay: '443' or '80,443,8000-8100'")
+    sp.add_argument("--remote-port", type=int, default=None,
+                    help="override destination port on the remote for all mapped ports")
+    sp.add_argument("--no-udp", action="store_true", help="relay TCP only")
+
+    sp = sub.add_parser("remove", help="remove all mappings for a local ip")
+    sp.add_argument("local")
+
+    sub.add_parser("list", help="list configured mappings")
+
+    sp = sub.add_parser("up", help="apply IP aliases and start the detached daemon")
+    sp.add_argument("--force", action="store_true", help="restart if already running")
+    sp.add_argument("--foreground", action="store_true",
+                    help="run the daemon in the foreground (debugging)")
+
+    sub.add_parser("down", help="stop the daemon and remove IP aliases")
+
+    sp = sub.add_parser("restart", help="down + up")
+    sp.add_argument("--force", action="store_true")
+
+    sp = sub.add_parser("status", help="show status; exit 0 if running, 3 if not")
+    sp.add_argument("--json", action="store_true", help="machine-readable output")
+
+    sp = sub.add_parser("logs", help="show the last log lines")
+    sp.add_argument("-n", type=int, default=40, help="number of lines (default 40)")
+
+    args = p.parse_args()
+    paths = runtime_paths(args.config)
+
+    if args.cmd in ("up", "down", "restart"):
+        cfg = load_config(paths["cfg"])
+        if needs_root_for(args.cmd, cfg, paths, args):
+            reexec_sudo(paths["cfg"])
+
+    os.makedirs(paths["dir"], exist_ok=True)
+
+    if args.cmd == "add":
+        do_add(args)
+    elif args.cmd == "remove":
+        do_remove(args)
+    elif args.cmd == "list":
+        do_list(args)
+    elif args.cmd == "up":
+        do_up(paths, force=args.force, foreground=args.foreground)
+    elif args.cmd == "down":
+        do_down(paths)
+    elif args.cmd == "restart":
+        do_restart(paths, force=args.force)
+    elif args.cmd == "status":
+        do_status(args)
+    elif args.cmd == "logs":
+        do_logs(args)
+
+
+if __name__ == "__main__":
+    main()
